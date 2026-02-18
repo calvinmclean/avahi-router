@@ -1,0 +1,13 @@
+services:
+  avahi-router:
+    build: .
+    container_name: avahi-router
+    restart: unless-stopped
+    network_mode: host
+    privileged: true
+    environment:
+      - HOST_IP=${HOST_IP}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/run/dbus:/var/run/dbus
+      - /var/run/avahi-daemon:/var/run/avahi-daemon
