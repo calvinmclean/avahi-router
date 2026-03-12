@@ -11,7 +11,7 @@ Avahi Router monitors Docker containers and automatically publishes mDNS (multic
 ## How It Works
 
 1. **Label Detection**: Avahi Router watches for Docker containers with the `avahi.hostname` label
-2. **mDNS Publishing**: When a labeled container starts, Avahi publishes the hostname pointing to the host IP
+2. **mDNS Publishing**: When a labeled container starts, Avahi publishes the hostname pointing to the host IP address or addresses
 3. **Automatic Cleanup**: When the container stops, the mDNS entry is removed
 4. **Reverse Proxy**: Your reverse proxy maps the hostname to the appropriate container port
 
@@ -20,8 +20,16 @@ Avahi Router monitors Docker containers and automatically publishes mDNS (multic
 ### 1. Start Avahi Router
 
 ```bash
-# Set your host IP (optional - auto-detected if not set)
+# Single-homed host: set a host IP explicitly (optional)
 export HOST_IP=192.168.1.100
+
+docker compose up -d
+```
+
+For multi-homed hosts, prefer interface names so Avahi Router can advertise one IPv4 address per LAN interface:
+
+```bash
+export HOST_INTERFACES=eth0,wlan0
 
 docker compose up -d
 ```
@@ -80,7 +88,20 @@ Now you can access `http://myapp.local` from any device on your local network.
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HOST_IP` | The IP address to advertise hostnames to | Auto-detected |
+| `HOST_INTERFACES` | Comma-separated interface list to advertise one IPv4 per interface | unset |
 | `TRAEFIK_ENABLED` | Enable Traefik annotation support (see below) | `false` |
+
+`HOST_INTERFACES` takes precedence over `HOST_IP`. Use it on multi-homed hosts where the default route IP is not the only LAN address that should receive `.local` traffic.
+
+### Multi-Homed Hosts
+
+On hosts with more than one active LAN interface, autodetection may choose only the default-route address. In that case, set:
+
+```bash
+export HOST_INTERFACES=eth0,wlan0
+```
+
+Avahi Router will resolve one IPv4 address per listed interface and advertise the same hostname on each of them. If `HOST_INTERFACES` is unset, `HOST_IP` remains the explicit single-address override. If both are unset, Avahi Router falls back to autodetection.
 
 ### Docker Labels
 
