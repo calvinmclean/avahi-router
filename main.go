@@ -25,15 +25,26 @@ const (
 )
 
 type ContainerInfo struct {
-	ID       string
-	Hostname string
-	Cmd      *exec.Cmd
+	ID        string
+	Hostname  string
+	Processes []*PublishProcess
+}
+
+type PublishProcess struct {
+	Interface string
+	IP        string
+	Cmd       *exec.Cmd
+}
+
+type HostAddress struct {
+	Interface string
+	IP        string
 }
 
 type ContainerManager struct {
 	mu         sync.RWMutex
 	containers map[string]*ContainerInfo
-	hostIP     string
+	hostAddrs  []HostAddress
 }
 
 func main() {
@@ -44,8 +55,12 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	hostIP := getHostIP()
-	fmt.Printf("Using host IP: %s\n", hostIP)
+	hostAddrs, err := getHostAddresses()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to determine host addresses: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Using host addresses: %s\n", formatHostAddresses(hostAddrs))
 
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
@@ -56,7 +71,7 @@ func main() {
 
 	containers := &ContainerManager{
 		containers: make(map[string]*ContainerInfo),
-		hostIP:     hostIP,
+		hostAddrs:  hostAddrs,
 	}
 
 	// List existing containers with the label
@@ -165,41 +180,44 @@ func (cm *ContainerManager) Start(ctx context.Context, id, hostname string) {
 	defer cm.mu.Unlock()
 
 	// Stop any existing avahi-publish for this container
-	if info, exists := cm.containers[id]; exists {
-		if info.Cmd != nil && info.Cmd.Process != nil {
-			if err := info.Cmd.Process.Kill(); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to kill avahi-publish for %s: %v\n", info.Hostname, err)
-			}
-			if _, err := info.Cmd.Process.Wait(); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to wait for avahi-publish for %s: %v\n", info.Hostname, err)
-			}
+	cm.stopLocked(id)
+
+	processes := make([]*PublishProcess, 0, len(cm.hostAddrs))
+	for _, hostAddr := range cm.hostAddrs {
+		cmd := exec.CommandContext(ctx, "avahi-publish", "-a", "-R", hostname, hostAddr.IP)
+		cmd.Stdout = os.Stderr
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to start avahi-publish for %s on %s -> %s: %v\n", hostname, hostAddr.Interface, hostAddr.IP, err)
+			continue
 		}
+
+		fmt.Printf("Advertising %s on %s -> %s (PID: %d)\n", hostname, hostAddr.Interface, hostAddr.IP, cmd.Process.Pid)
+		processes = append(processes, &PublishProcess{
+			Interface: hostAddr.Interface,
+			IP:        hostAddr.IP,
+			Cmd:       cmd,
+		})
+
+		// Monitor the process.
+		go func(hostname string, hostAddr HostAddress, cmd *exec.Cmd) {
+			err := cmd.Wait()
+			if err != nil && !strings.Contains(err.Error(), "signal: killed") {
+				fmt.Fprintf(os.Stderr, "avahi-publish for %s on %s -> %s exited: %v\n", hostname, hostAddr.Interface, hostAddr.IP, err)
+			}
+		}(hostname, hostAddr, cmd)
 	}
 
-	// Start avahi-publish
-	cmd := exec.CommandContext(ctx, "avahi-publish", "-a", "-R", hostname, cm.hostIP)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to start avahi-publish for %s: %v\n", hostname, err)
+	if len(processes) == 0 {
+		fmt.Fprintf(os.Stderr, "Failed to advertise %s on all configured addresses\n", hostname)
 		return
 	}
 
-	fmt.Printf("Advertising %s -> %s (PID: %d)\n", hostname, cm.hostIP, cmd.Process.Pid)
-
 	cm.containers[id] = &ContainerInfo{
-		ID:       id,
-		Hostname: hostname,
-		Cmd:      cmd,
+		ID:        id,
+		Hostname:  hostname,
+		Processes: processes,
 	}
-
-	// Monitor the process
-	go func() {
-		err := cmd.Wait()
-		if err != nil && !strings.Contains(err.Error(), "signal: killed") {
-			fmt.Fprintf(os.Stderr, "avahi-publish for %s exited: %v\n", hostname, err)
-		}
-	}()
 }
 
 func (cm *ContainerManager) Stop(id string) {
@@ -211,10 +229,12 @@ func (cm *ContainerManager) Stop(id string) {
 
 func (cm *ContainerManager) stopLocked(id string) {
 	if info, exists := cm.containers[id]; exists {
-		if info.Cmd != nil && info.Cmd.Process != nil {
-			fmt.Printf("Stopping advertisement for %s\n", info.Hostname)
-			if err := info.Cmd.Process.Kill(); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to kill avahi-publish for %s: %v\n", info.Hostname, err)
+		for _, process := range info.Processes {
+			if process.Cmd != nil && process.Cmd.Process != nil {
+				fmt.Printf("Stopping advertisement for %s on %s -> %s\n", info.Hostname, process.Interface, process.IP)
+				if err := process.Cmd.Process.Kill(); err != nil {
+					fmt.Fprintf(os.Stderr, "Failed to kill avahi-publish for %s on %s -> %s: %v\n", info.Hostname, process.Interface, process.IP, err)
+				}
 			}
 		}
 		delete(cm.containers, id)
@@ -296,20 +316,117 @@ func extractHostnameFromTraefikRule(rule string) string {
 	return rule[start:end]
 }
 
-func getHostIP() string {
-	// Check environment variable first
-	if ip := os.Getenv("HOST_IP"); ip != "" {
-		return ip
+func getHostAddresses() ([]HostAddress, error) {
+	if interfaces := parseInterfaceNames(os.Getenv("HOST_INTERFACES")); len(interfaces) > 0 {
+		return getAddressesForInterfaces(interfaces)
 	}
 
-	// Try to find the default interface IP
+	// Check environment variable first for the legacy single-IP mode.
+	if ip := os.Getenv("HOST_IP"); ip != "" {
+		return []HostAddress{{Interface: "HOST_IP", IP: ip}}, nil
+	}
+
+	// Fall back to the default-route IP for backwards compatibility.
 	conn, err := net.Dial("udp", "8.8.8.8:80")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to determine host IP: %v\n", err)
-		os.Exit(1)
+		return nil, err
 	}
 	defer conn.Close()
 
 	localAddr := conn.LocalAddr().(*net.UDPAddr)
-	return localAddr.IP.String()
+	return []HostAddress{{Interface: "default-route", IP: localAddr.IP.String()}}, nil
+}
+
+func parseInterfaceNames(value string) []string {
+	parts := strings.Split(value, ",")
+	names := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		name := strings.TrimSpace(part)
+		if name == "" {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	return names
+}
+
+func getAddressesForInterfaces(interfaceNames []string) ([]HostAddress, error) {
+	addresses := make([]HostAddress, 0, len(interfaceNames))
+	seenIPs := make(map[string]struct{})
+	var missing []string
+
+	for _, interfaceName := range interfaceNames {
+		iface, err := net.InterfaceByName(interfaceName)
+		if err != nil {
+			missing = append(missing, fmt.Sprintf("%s (%v)", interfaceName, err))
+			continue
+		}
+		if iface.Flags&net.FlagUp == 0 {
+			fmt.Fprintf(os.Stderr, "Skipping interface %s because it is down\n", interfaceName)
+			continue
+		}
+
+		ifaceAddrs, err := iface.Addrs()
+		if err != nil {
+			return nil, fmt.Errorf("failed to list addresses for interface %s: %w", interfaceName, err)
+		}
+
+		foundOnInterface := false
+		for _, ifaceAddr := range ifaceAddrs {
+			ip := extractIPv4(ifaceAddr)
+			if ip == "" {
+				continue
+			}
+			if _, exists := seenIPs[ip]; exists {
+				continue
+			}
+			seenIPs[ip] = struct{}{}
+			addresses = append(addresses, HostAddress{Interface: interfaceName, IP: ip})
+			foundOnInterface = true
+		}
+
+		if !foundOnInterface {
+			fmt.Fprintf(os.Stderr, "No usable IPv4 address found on interface %s\n", interfaceName)
+		}
+	}
+
+	if len(missing) > 0 {
+		fmt.Fprintf(os.Stderr, "Skipping unknown interfaces from HOST_INTERFACES: %s\n", strings.Join(missing, ", "))
+	}
+	if len(addresses) == 0 {
+		return nil, fmt.Errorf("HOST_INTERFACES=%q did not resolve to any usable IPv4 address", strings.Join(interfaceNames, ","))
+	}
+
+	return addresses, nil
+}
+
+func extractIPv4(addr net.Addr) string {
+	var ip net.IP
+	switch addr := addr.(type) {
+	case *net.IPNet:
+		ip = addr.IP
+	case *net.IPAddr:
+		ip = addr.IP
+	default:
+		return ""
+	}
+
+	ip = ip.To4()
+	if ip == nil || !ip.IsGlobalUnicast() {
+		return ""
+	}
+	return ip.String()
+}
+
+func formatHostAddresses(addresses []HostAddress) string {
+	parts := make([]string, 0, len(addresses))
+	for _, address := range addresses {
+		parts = append(parts, fmt.Sprintf("%s=%s", address.Interface, address.IP))
+	}
+	return strings.Join(parts, ", ")
 }
