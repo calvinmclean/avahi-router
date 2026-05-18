@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"reflect"
 	"testing"
 )
 
@@ -78,12 +79,23 @@ func TestExtractHostnameFromTraefikRule(t *testing.T) {
 	}
 }
 
+func TestExtractHostnamesFromTraefikRule(t *testing.T) {
+	rule := "Host(`studio.local`) || Host(\"jupyter.local\") || PathPrefix(`/`)"
+	expected := []string{"jupyter.local", "studio.local"}
+
+	result := extractHostnamesFromTraefikRule(rule)
+	if !reflect.DeepEqual(result, expected) {
+		t.Fatalf("extractHostnamesFromTraefikRule() = %v, want %v", result, expected)
+	}
+}
+
 func TestGetHostnameFromLabels(t *testing.T) {
 	tests := []struct {
 		name           string
 		labels         map[string]string
 		traefikEnabled bool
 		expected       string
+		expectedAny    []string
 	}{
 		{
 			name:           "Standard avahi.hostname label",
@@ -125,7 +137,7 @@ func TestGetHostnameFromLabels(t *testing.T) {
 			name:           "Traefik enabled with multiple routers",
 			labels:         map[string]string{"traefik.enable": "true", "traefik.http.routers.api.rule": "Host(`api.local`)", "traefik.http.routers.web.rule": "Host(`web.local`)"},
 			traefikEnabled: true,
-			expected:       "api.local",
+			expectedAny:    []string{"api.local", "web.local"},
 		},
 		{
 			name:           "Traefik enabled with complex router name",
@@ -157,6 +169,15 @@ func TestGetHostnameFromLabels(t *testing.T) {
 			}
 
 			result := getHostnameFromLabels(tt.labels)
+			if len(tt.expectedAny) > 0 {
+				for _, expected := range tt.expectedAny {
+					if result == expected {
+						return
+					}
+				}
+				t.Errorf("getHostnameFromLabels() = %q, want one of %v", result, tt.expectedAny)
+				return
+			}
 			if result != tt.expected {
 				t.Errorf("getHostnameFromLabels() = %q, want %q", result, tt.expected)
 			}
@@ -165,4 +186,72 @@ func TestGetHostnameFromLabels(t *testing.T) {
 
 	// Clean up
 	os.Unsetenv("TRAEFIK_ENABLED")
+}
+
+func TestGetHostnamesFromLabelsWithMultipleTraefikRouters(t *testing.T) {
+	t.Setenv("TRAEFIK_ENABLED", "true")
+
+	labels := map[string]string{
+		"traefik.enable": "true",
+		"traefik.http.routers.studio-secure.rule":   "Host(`unsloth.local`)",
+		"traefik.http.routers.jupyter-secure.rule":  "Host(`unsloth-jupyter.local`)",
+		"traefik.http.routers.ignored.entrypoints":  "websecure",
+		"traefik.http.services.studio.server.port":  "8000",
+		"traefik.http.services.jupyter.server.port": "8888",
+	}
+	expected := []string{"unsloth-jupyter.local", "unsloth.local"}
+
+	result := getHostnamesFromLabels(labels)
+	if !reflect.DeepEqual(result, expected) {
+		t.Fatalf("getHostnamesFromLabels() = %v, want %v", result, expected)
+	}
+}
+
+func TestParseInterfaceNames(t *testing.T) {
+	result := parseInterfaceNames(" eth0, wlan0 ,, eth0 ")
+	expected := []string{"eth0", "wlan0"}
+	if !reflect.DeepEqual(result, expected) {
+		t.Fatalf("parseInterfaceNames() = %v, want %v", result, expected)
+	}
+}
+
+func TestGetHostAddressesUsesHostIPFallback(t *testing.T) {
+	t.Setenv("HOST_INTERFACES", "")
+	t.Setenv("HOST_IP", "10.10.10.10")
+
+	addresses, err := getHostAddresses()
+	if err != nil {
+		t.Fatalf("getHostAddresses() returned error: %v", err)
+	}
+
+	expected := []HostAddress{{Interface: "HOST_IP", IP: "10.10.10.10"}}
+	if !reflect.DeepEqual(addresses, expected) {
+		t.Fatalf("getHostAddresses() = %v, want %v", addresses, expected)
+	}
+}
+
+func TestGetHostAddressesHOSTINTERFACESTakesPrecedence(t *testing.T) {
+	t.Setenv("HOST_INTERFACES", "missing0")
+	t.Setenv("HOST_IP", "10.10.10.10")
+
+	_, err := getHostAddresses()
+	if err == nil {
+		t.Fatal("getHostAddresses() returned nil error, want HOST_INTERFACES precedence failure")
+	}
+	if want := `HOST_INTERFACES="missing0"`; err.Error() != want+" did not resolve to any usable IPv4 address" {
+		t.Fatalf("getHostAddresses() error = %q, want %q", err.Error(), want+" did not resolve to any usable IPv4 address")
+	}
+}
+
+func TestFormatHostAddresses(t *testing.T) {
+	addresses := []HostAddress{
+		{Interface: "eth0", IP: "192.168.1.100"},
+		{Interface: "wlan0", IP: "10.0.0.5"},
+	}
+
+	got := formatHostAddresses(addresses)
+	want := "eth0=192.168.1.100, wlan0=10.0.0.5"
+	if got != want {
+		t.Fatalf("formatHostAddresses() = %q, want %q", got, want)
+	}
 }
