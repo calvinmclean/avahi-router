@@ -144,5 +144,6 @@ The following patterns are supported for extracting hostnames:
 
 - ``Host(`hostname`)`` - Backtick quotes (most common)
 - `Host("hostname")` - Double quotes
-- ``Host(`host1`) && PathPrefix(`/api`)`` - Combined with other matchers (extracts first host)
-- ``Host(`host1`) || Host(`host2`)`` - Multiple hosts (extracts first one)
+- ``Host(`host1`) && PathPrefix(`/api`)`` - Combined with other matchers
+- ``Host(`host1`) || Host(`host2`)`` - Multiple hosts
+- Multiple router rule labels on the same container - publishes every discovered host

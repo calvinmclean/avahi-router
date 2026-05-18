@@ -79,6 +79,16 @@ func TestExtractHostnameFromTraefikRule(t *testing.T) {
 	}
 }
 
+func TestExtractHostnamesFromTraefikRule(t *testing.T) {
+	rule := "Host(`studio.local`) || Host(\"jupyter.local\") || PathPrefix(`/`)"
+	expected := []string{"jupyter.local", "studio.local"}
+
+	result := extractHostnamesFromTraefikRule(rule)
+	if !reflect.DeepEqual(result, expected) {
+		t.Fatalf("extractHostnamesFromTraefikRule() = %v, want %v", result, expected)
+	}
+}
+
 func TestGetHostnameFromLabels(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -176,6 +186,25 @@ func TestGetHostnameFromLabels(t *testing.T) {
 
 	// Clean up
 	os.Unsetenv("TRAEFIK_ENABLED")
+}
+
+func TestGetHostnamesFromLabelsWithMultipleTraefikRouters(t *testing.T) {
+	t.Setenv("TRAEFIK_ENABLED", "true")
+
+	labels := map[string]string{
+		"traefik.enable": "true",
+		"traefik.http.routers.studio-secure.rule":   "Host(`unsloth.local`)",
+		"traefik.http.routers.jupyter-secure.rule":  "Host(`unsloth-jupyter.local`)",
+		"traefik.http.routers.ignored.entrypoints":  "websecure",
+		"traefik.http.services.studio.server.port":  "8000",
+		"traefik.http.services.jupyter.server.port": "8888",
+	}
+	expected := []string{"unsloth-jupyter.local", "unsloth.local"}
+
+	result := getHostnamesFromLabels(labels)
+	if !reflect.DeepEqual(result, expected) {
+		t.Fatalf("getHostnamesFromLabels() = %v, want %v", result, expected)
+	}
 }
 
 func TestParseInterfaceNames(t *testing.T) {

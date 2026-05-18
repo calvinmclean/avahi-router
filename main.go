@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,11 +27,12 @@ const (
 
 type ContainerInfo struct {
 	ID        string
-	Hostname  string
+	Hostnames []string
 	Processes []*PublishProcess
 }
 
 type PublishProcess struct {
+	Hostname  string
 	Interface string
 	IP        string
 	Cmd       *exec.Cmd
@@ -87,10 +89,10 @@ func main() {
 	}
 
 	for _, c := range containersList {
-		if hostname := getHostnameFromLabels(c.Labels); hostname != "" {
+		if hostnames := getHostnamesFromLabels(c.Labels); len(hostnames) > 0 {
 			if c.State == "running" {
-				fmt.Printf("Found existing running container %s with hostname %s\n", c.ID[:12], hostname)
-				containers.Start(ctx, c.ID, hostname)
+				fmt.Printf("Found existing running container %s with hostnames %s\n", c.ID[:12], strings.Join(hostnames, ", "))
+				containers.Start(ctx, c.ID, hostnames)
 			}
 		}
 	}
@@ -111,10 +113,10 @@ func main() {
 				if _, ok := c.Labels[labelKey]; ok {
 					continue
 				}
-				if hostname := getHostnameFromLabels(c.Labels); hostname != "" {
+				if hostnames := getHostnamesFromLabels(c.Labels); len(hostnames) > 0 {
 					if c.State == "running" {
-						fmt.Printf("Found existing running container %s with Traefik hostname %s\n", c.ID[:12], hostname)
-						containers.Start(ctx, c.ID, hostname)
+						fmt.Printf("Found existing running container %s with Traefik hostnames %s\n", c.ID[:12], strings.Join(hostnames, ", "))
+						containers.Start(ctx, c.ID, hostnames)
 					}
 				}
 			}
@@ -158,13 +160,13 @@ func handleEvent(ctx context.Context, cli *client.Client, msg events.Message, cm
 			return
 		}
 
-		if hostname := getHostnameFromLabels(containerJSON.Config.Labels); hostname != "" {
+		if hostnames := getHostnamesFromLabels(containerJSON.Config.Labels); len(hostnames) > 0 {
 			src := "avahi.hostname"
 			if _, ok := containerJSON.Config.Labels[labelKey]; !ok {
 				src = "traefik"
 			}
-			fmt.Printf("Container %s started with hostname %s (from %s)\n", msg.Actor.ID[:12], hostname, src)
-			cm.Start(ctx, msg.Actor.ID, hostname)
+			fmt.Printf("Container %s started with hostnames %s (from %s)\n", msg.Actor.ID[:12], strings.Join(hostnames, ", "), src)
+			cm.Start(ctx, msg.Actor.ID, hostnames)
 		}
 
 	case "stop", "die", "kill":
@@ -175,47 +177,50 @@ func handleEvent(ctx context.Context, cli *client.Client, msg events.Message, cm
 	}
 }
 
-func (cm *ContainerManager) Start(ctx context.Context, id, hostname string) {
+func (cm *ContainerManager) Start(ctx context.Context, id string, hostnames []string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
 	// Stop any existing avahi-publish for this container
 	cm.stopLocked(id)
 
-	processes := make([]*PublishProcess, 0, len(cm.hostAddrs))
-	for _, hostAddr := range cm.hostAddrs {
-		cmd := exec.CommandContext(ctx, "avahi-publish", "-a", "-R", hostname, hostAddr.IP)
-		cmd.Stdout = os.Stderr
-		cmd.Stderr = os.Stderr
-		if err := cmd.Start(); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to start avahi-publish for %s on %s -> %s: %v\n", hostname, hostAddr.Interface, hostAddr.IP, err)
-			continue
-		}
-
-		fmt.Printf("Advertising %s on %s -> %s (PID: %d)\n", hostname, hostAddr.Interface, hostAddr.IP, cmd.Process.Pid)
-		processes = append(processes, &PublishProcess{
-			Interface: hostAddr.Interface,
-			IP:        hostAddr.IP,
-			Cmd:       cmd,
-		})
-
-		// Monitor the process.
-		go func(hostname string, hostAddr HostAddress, cmd *exec.Cmd) {
-			err := cmd.Wait()
-			if err != nil && !strings.Contains(err.Error(), "signal: killed") {
-				fmt.Fprintf(os.Stderr, "avahi-publish for %s on %s -> %s exited: %v\n", hostname, hostAddr.Interface, hostAddr.IP, err)
+	processes := make([]*PublishProcess, 0, len(hostnames)*len(cm.hostAddrs))
+	for _, hostname := range hostnames {
+		for _, hostAddr := range cm.hostAddrs {
+			cmd := exec.CommandContext(ctx, "avahi-publish", "-a", "-R", hostname, hostAddr.IP)
+			cmd.Stdout = os.Stderr
+			cmd.Stderr = os.Stderr
+			if err := cmd.Start(); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to start avahi-publish for %s on %s -> %s: %v\n", hostname, hostAddr.Interface, hostAddr.IP, err)
+				continue
 			}
-		}(hostname, hostAddr, cmd)
+
+			fmt.Printf("Advertising %s on %s -> %s (PID: %d)\n", hostname, hostAddr.Interface, hostAddr.IP, cmd.Process.Pid)
+			processes = append(processes, &PublishProcess{
+				Hostname:  hostname,
+				Interface: hostAddr.Interface,
+				IP:        hostAddr.IP,
+				Cmd:       cmd,
+			})
+
+			// Monitor the process.
+			go func(hostname string, hostAddr HostAddress, cmd *exec.Cmd) {
+				err := cmd.Wait()
+				if err != nil && !strings.Contains(err.Error(), "signal: killed") {
+					fmt.Fprintf(os.Stderr, "avahi-publish for %s on %s -> %s exited: %v\n", hostname, hostAddr.Interface, hostAddr.IP, err)
+				}
+			}(hostname, hostAddr, cmd)
+		}
 	}
 
 	if len(processes) == 0 {
-		fmt.Fprintf(os.Stderr, "Failed to advertise %s on all configured addresses\n", hostname)
+		fmt.Fprintf(os.Stderr, "Failed to advertise %s on all configured addresses\n", strings.Join(hostnames, ", "))
 		return
 	}
 
 	cm.containers[id] = &ContainerInfo{
 		ID:        id,
-		Hostname:  hostname,
+		Hostnames: append([]string(nil), hostnames...),
 		Processes: processes,
 	}
 }
@@ -231,9 +236,9 @@ func (cm *ContainerManager) stopLocked(id string) {
 	if info, exists := cm.containers[id]; exists {
 		for _, process := range info.Processes {
 			if process.Cmd != nil && process.Cmd.Process != nil {
-				fmt.Printf("Stopping advertisement for %s on %s -> %s\n", info.Hostname, process.Interface, process.IP)
+				fmt.Printf("Stopping advertisement for %s on %s -> %s\n", process.Hostname, process.Interface, process.IP)
 				if err := process.Cmd.Process.Kill(); err != nil {
-					fmt.Fprintf(os.Stderr, "Failed to kill avahi-publish for %s on %s -> %s: %v\n", info.Hostname, process.Interface, process.IP, err)
+					fmt.Fprintf(os.Stderr, "Failed to kill avahi-publish for %s on %s -> %s: %v\n", process.Hostname, process.Interface, process.IP, err)
 				}
 			}
 		}
@@ -259,61 +264,97 @@ func (cm *ContainerManager) Has(id string) bool {
 }
 
 func getHostnameFromLabels(labels map[string]string) string {
+	hostnames := getHostnamesFromLabels(labels)
+	if len(hostnames) == 0 {
+		return ""
+	}
+	return hostnames[0]
+}
+
+func getHostnamesFromLabels(labels map[string]string) []string {
 	// First check for the standard avahi.hostname label
 	if hostname, ok := labels[labelKey]; ok {
-		return hostname
+		return uniqueSortedHostnames([]string{hostname})
 	}
 
 	// Check if Traefik support is enabled via env var
 	if os.Getenv("TRAEFIK_ENABLED") != "true" {
-		return ""
+		return nil
 	}
 
 	// Check if Traefik is enabled for this container
 	if enable, ok := labels[traefikEnableKey]; !ok || enable != "true" {
-		return ""
+		return nil
 	}
 
 	// Look for Traefik router rules with wildcard match
+	hostnames := make([]string, 0)
 	for key, value := range labels {
 		if strings.HasPrefix(key, traefikRuleKey) && strings.Contains(key, ".rule") {
-			if hostname := extractHostnameFromTraefikRule(value); hostname != "" {
-				return hostname
-			}
+			hostnames = append(hostnames, extractHostnamesFromTraefikRule(value)...)
 		}
 	}
 
-	return ""
+	return uniqueSortedHostnames(hostnames)
 }
 
 func extractHostnameFromTraefikRule(rule string) string {
-	// Look for Host(`hostname`) or Host("hostname") pattern
-	var endQuote byte
-	start := strings.Index(rule, "Host(`")
-	if start == -1 {
-		start = strings.Index(rule, "Host(\"")
-		if start == -1 {
-			return ""
+	hostnames := extractHostnamesFromTraefikRule(rule)
+	if len(hostnames) == 0 {
+		return ""
+	}
+	return hostnames[0]
+}
+
+func extractHostnamesFromTraefikRule(rule string) []string {
+	hostnames := make([]string, 0)
+	for {
+		startBacktick := strings.Index(rule, "Host(`")
+		startQuote := strings.Index(rule, "Host(\"")
+		if startBacktick == -1 && startQuote == -1 {
+			break
 		}
-		start += 6 // len("Host(\"")
-		endQuote = '"'
-	} else {
-		start += 6 // len("Host(`")
-		endQuote = '`'
+
+		var start int
+		var endQuote byte
+		if startBacktick != -1 && (startQuote == -1 || startBacktick < startQuote) {
+			start = startBacktick + len("Host(`")
+			endQuote = '`'
+		} else {
+			start = startQuote + len("Host(\"")
+			endQuote = '"'
+		}
+
+		end := strings.IndexByte(rule[start:], endQuote)
+		if end == -1 {
+			break
+		}
+		end += start
+		if end > start {
+			hostnames = append(hostnames, rule[start:end])
+		}
+		rule = rule[end+1:]
 	}
 
-	// Find the end of the hostname using the matching end quote
-	end := strings.IndexByte(rule[start:], endQuote)
-	if end == -1 {
-		return ""
-	}
-	end += start
+	return uniqueSortedHostnames(hostnames)
+}
 
-	if end <= start {
-		return ""
+func uniqueSortedHostnames(hostnames []string) []string {
+	seen := make(map[string]struct{}, len(hostnames))
+	unique := make([]string, 0, len(hostnames))
+	for _, hostname := range hostnames {
+		hostname = strings.TrimSpace(hostname)
+		if hostname == "" {
+			continue
+		}
+		if _, exists := seen[hostname]; exists {
+			continue
+		}
+		seen[hostname] = struct{}{}
+		unique = append(unique, hostname)
 	}
-
-	return rule[start:end]
+	sort.Strings(unique)
+	return unique
 }
 
 func getHostAddresses() ([]HostAddress, error) {
